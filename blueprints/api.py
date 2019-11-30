@@ -1,3 +1,4 @@
+import logging
 import mimetypes
 from datetime import datetime
 from datetime import timedelta
@@ -49,6 +50,8 @@ from core.shared import login_required
 from core.tasks import Tasks
 from utils import emojis
 from utils import now
+
+_logger = logging.getLogger(__name__)
 
 blueprint = flask.Blueprint("api", __name__)
 
@@ -439,11 +442,18 @@ def api_remove_from_list() -> _Response:
     return _user_api_response()
 
 
-@blueprint.route("/new_note", methods=["POST"])  # noqa: C901 too complex
+@blueprint.route("/new_note", methods=["POST", "GET"])  # noqa: C901 too complex
 @api_required
 def api_new_note() -> _Response:
+    # Basic Micropub (https://www.w3.org/TR/micropub/) query configuration support
+    if request.method == "GET" and request.args.get("q") == "config":
+        return jsonify({})
+    elif request.method == "GET":
+        abort(405)
+
     source = None
     summary = None
+    location = None
 
     # Basic Micropub (https://www.w3.org/TR/micropub/) "create" support
     is_micropub = False
@@ -457,8 +467,20 @@ def api_new_note() -> _Response:
         if "jwt_payload" not in flask.g or "create" not in flask.g.jwt_payload["scope"]:
             abort(403)
 
+        # Handle location sent via form-data
+        # `geo:28.5,9.0,0.0`
+        location = _user_api_arg("location", default="")
+        if location.startswith("geo:"):
+            slat, slng, *_ = location[4:].split(",")
+            location = {
+                "type": ap.ActivityType.PLACE.value,
+                "latitude": float(slat),
+                "longitude": float(slng),
+            }
+
         # Handle JSON microformats2 data
         if _user_api_arg("type", default=None):
+            _logger.info(f"Micropub request: {request.json}")
             try:
                 source = request.json["properties"]["content"][0]
             except (ValueError, KeyError):
@@ -486,6 +508,18 @@ def api_new_note() -> _Response:
 
     if summary is None:
         summary = _user_api_arg("summary", default="")
+
+    if not location:
+        if _user_api_arg("location_lat", default=None):
+            lat = float(_user_api_arg("location_lat"))
+            lng = float(_user_api_arg("location_lng"))
+            loc_name = _user_api_arg("location_name", default="")
+            location = {
+                "type": ap.ActivityType.PLACE.value,
+                "name": loc_name,
+                "latitude": lat,
+                "longitude": lng,
+            }
 
     # All the following fields are specific to the API (i.e. not Micropub related)
     _reply, reply = None, None
@@ -531,8 +565,8 @@ def api_new_note() -> _Response:
 
     raw_note = dict(
         attributedTo=MY_PERSON.id,
-        cc=list(set(cc)),
-        to=list(set(to)),
+        cc=list(set(cc) - set([MY_PERSON.id])),
+        to=list(set(to) - set([MY_PERSON.id])),
         summary=summary,
         content=content,
         tag=tags,
@@ -540,6 +574,9 @@ def api_new_note() -> _Response:
         inReplyTo=reply.id if reply else None,
         context=context,
     )
+
+    if location:
+        raw_note["location"] = location
 
     if request.files:
         for f in request.files.keys():

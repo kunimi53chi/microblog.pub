@@ -2,6 +2,7 @@ import logging
 import urllib
 from datetime import datetime
 from datetime import timezone
+from functools import lru_cache
 from urllib.parse import urlparse
 
 import bleach
@@ -9,6 +10,7 @@ import emoji_unicode
 import flask
 import html2text
 import timeago
+from bs4 import BeautifulSoup
 from cachetools import LRUCache
 from little_boxes import activitypub as ap
 from little_boxes.activitypub import _to_list
@@ -104,7 +106,15 @@ ALLOWED_TAGS = [
     "tfoot",
     "colgroup",
     "caption",
+    "img",
 ]
+
+ALLOWED_ATTRIBUTES = {
+    "a": ["href", "title"],
+    "abbr": ["title"],
+    "acronym": ["title"],
+    "img": ["src", "alt", "title"],
+}
 
 
 @filters.app_template_filter()
@@ -126,7 +136,9 @@ def replace_custom_emojis(content, note):
 
 def clean_html(html):
     try:
-        return bleach.clean(html, tags=ALLOWED_TAGS, strip=True)
+        return bleach.clean(
+            html, tags=ALLOWED_TAGS, attributes=ALLOWED_ATTRIBUTES, strip=True
+        )
     except Exception:
         return "failed to clean HTML"
 
@@ -241,6 +253,36 @@ def get_actor(url):
 
 
 @filters.app_template_filter()
+def has_place(note):
+    if note.get("location") and note["location"].get("type") == "Place":
+        return True
+    return False
+
+
+@filters.app_template_filter()
+def get_place(note):
+    if note.get("location") and note["location"].get("type") == "Place":
+        tag = note["location"]
+        lat = tag["latitude"]
+        lng = tag["longitude"]
+        out = ""
+        if tag.get("name"):
+            out += f"{tag['name']} "
+
+        out += (
+            '<span class="h-geo">'
+            f'<data class="p-latitude" value="{lat}"></data>'
+            f'<data class="p-longitude" value="{lng}"></data>'
+            f'<a href="https://www.openstreetmap.org/?mlat={lat}&mlon={lng}#map=16/{lat}/{lng}">{lat},{lng}</a>'
+            "</span>"
+        )
+
+        return out
+
+    return ""
+
+
+@filters.app_template_filter()
 def poll_answer_key(choice: str) -> str:
     return _answer_key(choice)
 
@@ -303,6 +345,22 @@ def get_attachment_url(url, size):
 
 
 @filters.app_template_filter()
+@lru_cache(maxsize=256)
+def update_inline_imgs(content):
+    soup = BeautifulSoup(content, "html5lib")
+    imgs = soup.find_all("img")
+    if not imgs:
+        return content
+    for img in imgs:
+        if not img.attrs.get("src"):
+            continue
+
+        img.attrs["src"] = _get_file_url(img.attrs["src"], 720, Kind.ATTACHMENT)
+
+    return soup.find("body").decode_contents()
+
+
+@filters.app_template_filter()
 def get_video_url(url):
     if isinstance(url, list):
         for link in url:
@@ -359,6 +417,28 @@ def has_actor_type(doc):
         if has_type(doc, t.value):
             return True
     return False
+
+
+@lru_cache(maxsize=256)
+def _get_inlined_imgs(content):
+    imgs = []
+    if not content:
+        return imgs
+
+    soup = BeautifulSoup(content, "html5lib")
+    for img in soup.find_all("img"):
+        src = img.attrs.get("src")
+        if src:
+            imgs.append(src)
+
+    return imgs
+
+
+@filters.app_template_filter()
+def iter_note_attachments(note):
+    attachments = note.get("attachment", [])
+    imgs = _get_inlined_imgs(note.get("content"))
+    return [a for a in attachments if a.get("url") not in imgs]
 
 
 @filters.app_template_filter()
